@@ -76,13 +76,43 @@ fi
 
 echo "[INFO] Using Python: $(${PYTHON_BIN} --version 2>&1)"
 
-# Check if --skip-db-load is present
+# Check CLI flags (--skip-db-load and --engine)
 SKIP_DB_LOAD=false
+HAS_ENGINE_FLAG=false
 for arg in "$@"; do
     if [[ "${arg}" == "--skip-db-load" ]]; then
         SKIP_DB_LOAD=true
     fi
+    if [[ "${arg}" == "--engine" || "${arg}" == --engine=* ]]; then
+        HAS_ENGINE_FLAG=true
+    fi
 done
+
+ENGINE_ARGS=()
+if [[ "${HAS_ENGINE_FLAG}" == "false" ]]; then
+    if [[ -n "${ETL_ENGINE:-}" ]]; then
+        ENGINE_ARGS=("--engine" "${ETL_ENGINE}")
+        echo "[INFO] Selected engine from ETL_ENGINE env: ${ETL_ENGINE}"
+    elif [[ -t 0 ]]; then
+        echo ""
+        echo "Select ETL processing engine:"
+        echo "  [1] pandas  (fast single-node in-memory, no Java required)"
+        echo "  [2] pyspark (distributed Spark SQL via JVM)"
+        read -r -p "Enter choice [1/2 or pandas/pyspark, default=pandas]: " engine_input || true
+        case "${engine_input,,}" in
+            2|pyspark|spark)
+                ENGINE_ARGS=("--engine" "pyspark")
+                ;;
+            *)
+                ENGINE_ARGS=("--engine" "pandas")
+                ;;
+        esac
+        echo "[INFO] Selected engine: ${ENGINE_ARGS[1]}"
+    else
+        ENGINE_ARGS=("--engine" "pandas")
+        echo "[INFO] Non-interactive mode; defaulting to engine: pandas"
+    fi
+fi
 
 if [[ "${SKIP_DB_LOAD}" == "false" ]]; then
     echo "[INFO] Verifying PostgreSQL and MongoDB readiness..."
@@ -136,7 +166,7 @@ else
 fi
 
 echo "[INFO] Executing ETL pipeline..."
-"${PYTHON_BIN}" -m src.pipeline --generate-if-missing "$@"
+"${PYTHON_BIN}" -m src.pipeline --generate-if-missing "${ENGINE_ARGS[@]}" "$@"
 
 # Archive processed raw files with run timestamp
 echo "[INFO] Archiving processed raw files to ${PROCESSED_DIR}..."

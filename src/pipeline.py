@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -48,46 +49,42 @@ from src.validate import (
     validate_orders,
 )
 
+SUPPORTED_ENGINES = ("pandas", "pyspark")
 
-def run_pipeline(
-    generate_if_missing: bool = False,
-    regenerate: bool = False,
-    skip_db_load: bool = False,
-    customers_count: int = 10_000,
-    orders_count: int = 25_000,
-    activity_count: int = 20_000,
-    batch_size: int = BATCH_SIZE,
+
+def resolve_engine_choice(cli_engine: str | None) -> str:
+    """Resolve processing engine from CLI flag, env var, or interactive terminal prompt."""
+    if cli_engine is not None:
+        return cli_engine.lower()
+
+    env_engine = os.getenv("ETL_ENGINE", "").strip().lower()
+    if env_engine in SUPPORTED_ENGINES:
+        return env_engine
+
+    if sys.stdin is not None and sys.stdin.isatty():
+        print("\nSelect ETL processing engine:")
+        print("  [1] pandas  (fast single-node in-memory, no Java required)")
+        print("  [2] pyspark (distributed Spark SQL via JVM)")
+        while True:
+            choice = input("Enter choice [1/2 or pandas/pyspark, default=pandas]: ").strip().lower()
+            if choice in ("", "1", "pandas"):
+                return "pandas"
+            if choice in ("2", "pyspark", "spark"):
+                return "pyspark"
+            print("Invalid selection. Please enter '1' (pandas) or '2' (pyspark).")
+
+    return "pandas"
+
+
+def _run_pandas_stages(
+    batch_id: str,
+    run_ts: str,
 ) -> dict[str, Any]:
-    """Execute the complete Extract -> Validate -> Transform -> Load pipeline."""
-    ensure_directories()
-    run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    batch_id = f"batch_{run_ts}"
-    log_file = LOGS_DIR / f"pipeline_{run_ts}.log"
-    logger = get_logger("pipeline", log_file=log_file)
-
-    started_at = datetime.now(timezone.utc)
-    t0 = time.perf_counter()
-    logger.info("Starting ETL pipeline batch_id=%s", batch_id)
-
-    raw_missing = not (
-        CUSTOMERS_RAW_FILE.exists()
-        and ORDERS_RAW_FILE.exists()
-        and ACTIVITY_LOGS_RAW_FILE.exists()
-    )
-    if regenerate or (generate_if_missing and raw_missing):
-        logger.info("Generating synthetic multi-source dataset...")
-        generate_all(
-            customers_count=customers_count,
-            orders_count=orders_count,
-            activity_count=activity_count,
-        )
-
-    # 1. EXTRACT
+    """Run Extract, Validate/Quarantine, and Transform/PII Masking using Pandas."""
     t_ext = time.perf_counter()
     extracted = extract_all()
     extract_seconds = round(time.perf_counter() - t_ext, 3)
 
-    # 2. VALIDATE & QUARANTINE
     t_val = time.perf_counter()
     val_customers = validate_customers(
         extracted["customers"].dataframe,
@@ -114,7 +111,6 @@ def run_pipeline(
     }
     validate_seconds = round(time.perf_counter() - t_val, 3)
 
-    # 3. TRANSFORM & PII MASKING
     t_tr = time.perf_counter()
     customers_clean, cust_dupes_removed = transform_customers(val_customers.valid_df)
     orders_clean, order_items_clean, ord_dupes_removed = transform_orders(
@@ -128,8 +124,6 @@ def run_pipeline(
         "orders": ord_dupes_removed,
         "activity_logs": act_dupes_removed,
     }
-    total_dupes_removed = sum(dupes_removed_map.values())
-
     dq_report, dq_report_path = generate_dq_report(
         validation_results,
         batch_id=batch_id,
@@ -137,6 +131,82 @@ def run_pipeline(
         logs_dir=LOGS_DIR,
         duplicates_removed_by_source=dupes_removed_map,
     )
+
+    return {
+        "customers_clean": customers_clean,
+        "orders_clean": orders_clean,
+        "order_items_clean": order_items_clean,
+        "activity_clean": activity_clean,
+        "dq_report": dq_report,
+        "dq_report_path": dq_report_path,
+        "dupes_removed": sum(dupes_removed_map.values()),
+        "timings": {
+            "extract": extract_seconds,
+            "validate": validate_seconds,
+            "transform": transform_seconds,
+        },
+    }
+
+
+def run_pipeline(
+    engine: str = "pandas",
+    generate_if_missing: bool = False,
+    regenerate: bool = False,
+    skip_db_load: bool = False,
+    customers_count: int = 10_000,
+    orders_count: int = 25_000,
+    activity_count: int = 20_000,
+    batch_size: int = BATCH_SIZE,
+) -> dict[str, Any]:
+    """Execute the complete Extract -> Validate -> Transform -> Load pipeline."""
+    engine = engine.lower()
+    if engine not in SUPPORTED_ENGINES:
+        raise ValueError(f"Unsupported engine '{engine}'. Choose from {SUPPORTED_ENGINES}.")
+
+    ensure_directories()
+    run_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    batch_id = f"batch_{run_ts}"
+    log_file = LOGS_DIR / f"pipeline_{run_ts}.log"
+    logger = get_logger("pipeline", log_file=log_file)
+
+    started_at = datetime.now(timezone.utc)
+    t0 = time.perf_counter()
+    logger.info("Starting ETL pipeline batch_id=%s engine=%s", batch_id, engine)
+
+    raw_missing = not (
+        CUSTOMERS_RAW_FILE.exists()
+        and ORDERS_RAW_FILE.exists()
+        and ACTIVITY_LOGS_RAW_FILE.exists()
+    )
+    if regenerate or (generate_if_missing and raw_missing):
+        logger.info("Generating synthetic multi-source dataset...")
+        generate_all(
+            customers_count=customers_count,
+            orders_count=orders_count,
+            activity_count=activity_count,
+        )
+
+    if engine == "pyspark":
+        from src.spark_engine import create_spark_session, run_spark_etl_stages
+
+        spark = create_spark_session(app_name=f"ETL_{batch_id}")
+        try:
+            stage_out = run_spark_etl_stages(spark, batch_id=batch_id, run_ts=run_ts)
+        finally:
+            spark.stop()
+    else:
+        stage_out = _run_pandas_stages(batch_id=batch_id, run_ts=run_ts)
+
+    customers_clean = stage_out["customers_clean"]
+    orders_clean = stage_out["orders_clean"]
+    order_items_clean = stage_out["order_items_clean"]
+    activity_clean = stage_out["activity_clean"]
+    dq_report = stage_out["dq_report"]
+    dq_report_path = stage_out["dq_report_path"]
+    total_dupes_removed = stage_out["dupes_removed"]
+    extract_seconds = stage_out["timings"]["extract"]
+    validate_seconds = stage_out["timings"]["validate"]
+    transform_seconds = stage_out["timings"]["transform"]
 
     quarantine_pct = dq_report["summary"]["quarantine_rate_pct"]
     if quarantine_pct > QUARANTINE_THRESHOLD_PCT:
@@ -173,6 +243,7 @@ def run_pipeline(
 
         t_mg = time.perf_counter()
         prelim_metrics = {
+            "engine": engine,
             "extract_seconds": extract_seconds,
             "validate_seconds": validate_seconds,
             "transform_seconds": transform_seconds,
@@ -222,6 +293,7 @@ def run_pipeline(
     total_seconds = round(time.perf_counter() - t0, 3)
     summary = {
         "batch_id": batch_id,
+        "engine": engine,
         "status": "SUCCESS",
         "total_records_read": dq_report["summary"]["total_rows_read"],
         "valid_records_passed": dq_report["summary"]["total_valid_rows"],
@@ -248,13 +320,19 @@ def run_pipeline(
         "dq_report_path": str(dq_report_path),
         "log_file": str(log_file),
     }
-    logger.info("Pipeline completed successfully in %.3fs", total_seconds)
+    logger.info("Pipeline (%s) completed successfully in %.3fs", engine, total_seconds)
     return summary
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run Multi-Source ETL & Data Quality Pipeline."
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["pandas", "pyspark"],
+        default=None,
+        help="Processing engine ('pandas' or 'pyspark'). Prompts interactively if omitted on TTY.",
     )
     parser.add_argument(
         "--generate-if-missing",
@@ -278,7 +356,9 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        chosen_engine = resolve_engine_choice(args.engine)
         result = run_pipeline(
+            engine=chosen_engine,
             generate_if_missing=args.generate_if_missing,
             regenerate=args.regenerate,
             skip_db_load=args.skip_db_load,
