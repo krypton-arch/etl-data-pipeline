@@ -79,14 +79,16 @@ etl-data-pipeline/
 │   ├── transform.py             # Deduplication, standardization, PII masking, enrichment
 │   ├── load_postgres.py         # Idempotent batch upserts into PostgreSQL
 │   ├── load_mongodb.py          # Bulk UpdateOne upserts & compound indexes in MongoDB
-│   └── pipeline.py              # Main CLI entrypoint (Extract -> Validate -> Transform -> Load)
+│   ├── spark_engine.py          # Distributed PySpark SQL engine (Extract/Validate/Transform)
+│   └── pipeline.py              # Main CLI entrypoint with interactive engine selection
 ├── scripts/
-│   ├── run_etl.sh               # Master Bash runner with logging, traps, and archival
+│   ├── run_etl.sh               # Master Bash runner with engine prompt, traps & archival
 │   └── schedule_cron.sh         # Helper script for daily crontab batch scheduling
 ├── tests/
 │   ├── conftest.py
 │   ├── test_validation.py       # Schema enforcement, quarantine routing, DQ report tests
-│   └── test_transformations.py  # Deduplication, imputation, and PII masking tests
+│   ├── test_transformations.py  # Deduplication, imputation, and PII masking tests
+│   └── test_spark_engine.py     # PySpark engine & interactive selection tests
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .env.example
@@ -99,6 +101,7 @@ etl-data-pipeline/
 
 ### 1. Prerequisites
 - Python 3.11+
+- Java 17/21 (required **only** when running the `pyspark` engine; `pandas` mode requires no Java)
 - Docker & Docker Compose
 - Bash (`bash` on Linux/macOS or Git Bash on Windows)
 
@@ -114,15 +117,25 @@ docker compose up -d --wait
 ```
 > **Note:** By default, `.env.example` and `docker-compose.yml` bind PostgreSQL to `5433` and MongoDB to `27018` on localhost to avoid collisions with pre-installed local database services. Override `POSTGRES_PORT` / `MONGO_PORT` in `.env` if needed.
 
-### 4. Run the End-to-End Pipeline
+### 4. Run the End-to-End Pipeline (Pandas or PySpark)
+Running interactively without `--engine` prompts you to choose between `pandas` and `pyspark`:
 ```bash
 ./scripts/run_etl.sh
+# Select ETL processing engine:
+#   [1] pandas  (fast single-node in-memory, no Java required)
+#   [2] pyspark (distributed Spark SQL via JVM)
 ```
-On the first run (when `data/raw/` is empty), `run_etl.sh` automatically triggers `src/generate_sample_data.py` via `--generate-if-missing`, validates and transforms all 55,000 records, loads both databases idempotently, writes the Data Quality Report to `logs/`, and archives processed raw files to `data/processed/`.
+Or specify the engine explicitly (recommended for cron/CI):
+```bash
+./scripts/run_etl.sh --engine pandas
+./scripts/run_etl.sh --engine pyspark
+```
+On the first run (when `data/raw/` is empty), `run_etl.sh` automatically triggers `src/generate_sample_data.py` via `--generate-if-missing`, validates and transforms records using the chosen engine, loads both databases idempotently, writes the Data Quality Report to `logs/`, and archives processed raw files to `data/processed/`.
 
 To run a dry-run without database containers:
 ```bash
-python -m src.pipeline --generate-if-missing --skip-db-load
+python -m src.pipeline --engine pandas --generate-if-missing --skip-db-load
+python -m src.pipeline --engine pyspark --generate-if-missing --skip-db-load
 ```
 
 ### 5. Run the Unit Test Suite

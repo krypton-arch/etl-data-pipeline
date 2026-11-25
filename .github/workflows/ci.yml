@@ -28,6 +28,10 @@ jobs:
       - name: Run unit tests (pytest)
         run: python -m pytest -v
 
-      - name: Run end-to-end pipeline dry-run smoke test
+      - name: Run Pandas pipeline dry-run smoke test
         run: |
-          python -m src.pipeline --generate-if-missing --skip-db-load --customers-count 1000 --orders-count 2500 --activity-count 2000
+          python -m src.pipeline --engine pandas --generate-if-missing --skip-db-load --customers-count 1000 --orders-count 2500 --activity-count 2000
+
+      - name: Run PySpark pipeline dry-run smoke test
+        run: |
+          python -m src.pipeline --engine pyspark --generate-if-missing --skip-db-load --customers-count 1000 --orders-count 2500 --activity-count 2000
